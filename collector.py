@@ -1,99 +1,95 @@
-from flask import Flask, request, jsonify
-import os
-import psycopg2
+from flask import Flask
+import paramiko
+import time
 from datetime import datetime
-from flask_socketio import SocketIO, emit
+import requests
+import logging
 from flask_cors import CORS
+import threading
+import signal
+import sys
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
-# Конфигурация
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 LOG_FILES = ["/var/log/syslog", "/var/log/dmesg", "/var/log/auth.log", "/var/log/kern.log", "/var/log/dpkg.log"]
-DB_SERVER_URL = "http://192.168.1.51:5000/logs"  
+DB_SERVER_URL = "http://192.168.1.51:5000/logs"
+REMOTE_HOST = "192.168.1.197"
+REMOTE_USER = "client"
+REMOTE_PASSWORD = "1234"
+
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-CORS(app, resources={r"/*": {"origins": "http://192.168.1.197:5000"}})
-
-# Инициализация SocketIO
-socketio = SocketIO(app, cors_allowed_origins="http://192.168.1.197:5000")
-
-analyzed_logs = []
-alerts = []
-
-def get_db_connection():
-    try:
-        conn = psycopg2.connect(dbname="logs_db", user="postgres", password="1234", host="localhost", port="5432")
-        return conn
-    except Exception as e:
-        print(f"Error connecting to DB: {e}")
-        return None
+# Настройка сессии с повторными попытками
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+session.mount('http://', HTTPAdapter(max_retries=retries))
 
 def analyze_log(log):
     suspicious_keywords = ["error", "unauthorized", "failed", "malware", "attack"]
     for keyword in suspicious_keywords:
         if keyword in log.lower():
+            logger.debug(f"Suspicious log detected with keyword: {keyword}")
             return True, f"Detected keyword: {keyword}"
     return False, None
 
 def send_to_db(log, reason, timestamp):
     try:
-        timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S') 
-        
-        conn = get_db_connection()
-        if conn is None:
-            print("No DB connection, skipping log insertion.")
-            return
-        
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO suspicious_logs (log, reason, created_at) VALUES (%s, %s, %s)",
-            (log, reason, timestamp_str)
-        )
-        conn.commit()
+        timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        data = {
+            "log": log,
+            "reason": reason,
+            "created_at": timestamp_str
+        }
+        response = session.post(DB_SERVER_URL, json=data, timeout=10)
+        response.raise_for_status()
+        logger.debug(f"Log sent successfully: {data}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending log to DB: {e}")
 
-        cursor.execute("SELECT COUNT(*) FROM suspicious_logs")
-        total_logs = cursor.fetchone()[0]
-        conn.close()
+def tail_log(log_file):
+    while True:
+        try:
+            with paramiko.SSHClient() as client:
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(REMOTE_HOST, username=REMOTE_USER, password=REMOTE_PASSWORD)
+                logger.debug(f"Connected to {REMOTE_HOST} for {log_file}")
+                
+                stdin, stdout, stderr = client.exec_command(f"tail -f {log_file}")
+                while True:
+                    line = stdout.readline()
+                    if line:
+                        log_line = line.strip()
+                        logger.debug(f"Log line from {log_file}: {log_line}")
 
-        print(f"Total logs in DB: {total_logs}")
-        socketio.emit('update_log_count', {"count": total_logs}, broadcast=True)
+                        is_suspicious, reason = analyze_log(log_line)
+                        if is_suspicious:
+                            logger.debug(f"Suspicious log detected in {log_file}: {log_line}, reason: {reason}")
+                            timestamp = datetime.now()
+                            send_to_db(log_line, reason, timestamp)
+                    else:
+                        break
+        except Exception as e:
+            logger.error(f"Error in tail_log for {log_file}: {e}")
+            time.sleep(5)  # Wait before retrying
 
-    except Exception as e:
-        print(f"Error sending log to DB: {e}")
-
-def process_logs():
-    global analyzed_logs, alerts
-    for log_file in LOG_FILES:
-        if os.path.exists(log_file):
-            with open(log_file, "r") as f:
-                for line in f:
-                    is_suspicious, reason = analyze_log(line)
-                    analyzed_logs.append(line)
-                    if is_suspicious:
-                        alerts.append({"log": line, "reason": reason})
-                        timestamp = datetime.now()  
-                        send_to_db(line, reason, timestamp)
-
-@socketio.on('new_log')
-def handle_new_log(data):
-    print(f"New log received: {data}")
-    emit('new_log', data, broadcast=True)
-
-@app.route("/logs", methods=["GET"])
-def get_logs():
-    try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"error": "Unable to connect to database"}), 500
-        
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, log, reason, created_at FROM suspicious_logs ORDER BY created_at DESC")
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return jsonify(rows)
-    except Exception as e:
-        print(f"Error fetching logs: {e}")
-        return jsonify({"error": str(e)}), 500
+def signal_handler(signum, frame):
+    logger.info("Received signal to terminate. Closing connections...")
+    sys.exit(0)
 
 if __name__ == "__main__":
-    process_logs()
-    socketio.run(app, host='0.0.0.0', port=5000)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    logger.debug("Starting the log collection process...")
+    threads = []
+    for log_file in LOG_FILES:
+        thread = threading.Thread(target=tail_log, args=(log_file,))
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
