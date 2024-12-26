@@ -1,11 +1,18 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import psycopg2
 from datetime import datetime
-import socketio
-import eventlet  # Для работы с eventlet
-from flask_cors import CORS  # Импортируем CORS для поддержки междоменных запросов
+import logging
 
-# Конфигурация PostgreSQL
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
 DB_CONFIG = {
     'dbname': 'logs_db',
     'user': 'postgres',
@@ -14,84 +21,114 @@ DB_CONFIG = {
     'port': 5432
 }
 
-app = Flask(__name__)
-
-# Настройка CORS для Flask (необязательно, если только WebSocket используется)
-CORS(app, resources={r"/*": {"origins": "http://192.168.1.197:5000"}})
-
-# Настройка SocketIO с разрешением подключений только с определённого источника
-sio = socketio.Server(cors_allowed_origins="http://192.168.1.197:5000", async_mode='eventlet')
-
-# Подключаем SocketIO к Flask
-app.wsgi_app = socketio.WSGIApp(sio, app.wsgi_app)
-
-# Подключение к базе данных
 def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
-
-# Инициализация базы данных
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS suspicious_logs (
-            id SERIAL PRIMARY KEY,
-            log TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-# API для добавления логов
-@app.route("/logs", methods=["POST"])
-def add_log():
-    data = request.get_json()
-    if not data or "log" not in data or "reason" not in data:
-        return jsonify({"error": "Invalid data"}), 400
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Преобразуем строку даты в объект datetime
-        if "created_at" in data:
-            created_at = datetime.strptime(data["created_at"], '%Y-%m-%d %H:%M:%S')
-        else:
-            created_at = datetime.now()
-
-        cursor.execute(
-            "INSERT INTO suspicious_logs (log, reason, created_at) VALUES (%s, %s, %s)",
-            (data["log"], data["reason"], created_at)
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-        # Отправляем новое сообщение через WebSocket
-        sio.emit('new_log', {"log": data["log"], "reason": data["reason"], "created_at": created_at.isoformat()})
-
-        return jsonify({"status": "success"}), 200
+        logger.debug("Attempting to connect to database...")
+        conn = psycopg2.connect(**DB_CONFIG)
+        logger.debug("Database connection successful")
+        return conn
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Database connection error: {str(e)}")
+        raise
 
-# API для получения логов
 @app.route("/logs", methods=["GET"])
 def get_logs():
     try:
+        logger.debug("Received request for logs")
+        last_id = request.args.get('last_id', 0, type=int)
+        logger.debug(f"Last ID parameter: {last_id}")
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, log, reason, created_at FROM suspicious_logs")
+        
+        # Проверяем наличие данных в таблице
+        cursor.execute("SELECT COUNT(*) FROM suspicious_logs")
+        count = cursor.fetchone()[0]
+        logger.debug(f"Total records in database: {count}")
+        
+        query = """
+            SELECT id, log, reason, created_at 
+            FROM suspicious_logs 
+            WHERE id > %s 
+            ORDER BY created_at DESC
+        """
+        cursor.execute(query, (last_id,))
         rows = cursor.fetchall()
+        logger.debug(f"Fetched {len(rows)} rows from database")
+
+        logs = []
+        for row in rows:
+            logs.append({
+                "id": row[0],
+                "log": row[1],
+                "reason": row[2],
+                "created_at": row[3].isoformat()
+            })
+        
         cursor.close()
         conn.close()
-        return jsonify(rows)
+        
+        logger.debug(f"Returning {len(logs)} logs")
+        return jsonify(logs)
+
+    except psycopg2.Error as e:
+        logger.error(f"Database error: {str(e)}")
+        return jsonify({"error": "Database error", "details": str(e)}), 500
     except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return jsonify({"error": "Server error", "details": str(e)}), 500
+
+@app.route("/logs", methods=["POST"])
+def add_log():
+    try:
+        data = request.get_json()
+        logger.debug(f"Received log data: {data}")
+        
+        if not data or "log" not in data or "reason" not in data:
+            return jsonify({"error": "Invalid data"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        created_at = datetime.now() if "created_at" not in data else datetime.strptime(data["created_at"], '%Y-%m-%d %H:%M:%S')
+        
+        cursor.execute(
+            "INSERT INTO suspicious_logs (log, reason, created_at) VALUES (%s, %s, %s) RETURNING id",
+            (data["log"], data["reason"], created_at)
+        )
+        
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.debug(f"Successfully inserted log with id: {new_id}")
+        return jsonify({"status": "success", "id": new_id}), 200
+        
+    except Exception as e:
+        logger.error(f"Error adding log: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    init_db()
-    # Запускаем сервер через eventlet
-    eventlet.wsgi.server(eventlet.listen(("0.0.0.0", 5000)), app)
+    # Проверяем подключение к БД при запуске
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Проверяем существование таблицы
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS suspicious_logs (
+                id SERIAL PRIMARY KEY,
+                log TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info("Database connection test successful, table verified")
+    except Exception as e:
+        logger.error(f"Database initialization error: {str(e)}")
+        raise
+
+    app.run(host='0.0.0.0', port=5000, debug=True)
