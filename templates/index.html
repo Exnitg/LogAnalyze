@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Analyze</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <h1>Log Analyze</h1>
+    </header>
+    <div class="summary">
+        <p>Total Logs Processed: <span id="total-logs">0</span></p>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Log</th>
+                <th>Reason</th>
+                <th>Timestamp</th>
+            </tr>
+        </thead>
+        <tbody id="log-table">
+        </tbody>
+    </table>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.0/socket.io.min.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
